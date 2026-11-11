@@ -90,7 +90,11 @@ def run_command(
         stderr=subprocess.PIPE,
         timeout=timeout,
         check=check,
-        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        # C.UTF-8 keeps package-manager output stable (English messages,
+        # predictable formats) while allowing UTF-8: the Proxmox Notes
+        # contain non-ASCII characters, and LC_ALL=C (pure ASCII) corrupts
+        # them to U+FFFD when written via pvesh/pct.
+        env={**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"},
     )
 
 
@@ -615,10 +619,10 @@ def build_global_report(containers: list[dict[str, Any]], generated_at: str) -> 
         rows = []
         for package_name in sorted(package_records):
             package_record = package_records[package_name]
-            candidate_values = str(sorted(package_record["candidates"]))
+            candidate_values = sorted(package_record["candidates"])
             candidate_text = ", ".join(candidate_values)
             if len(candidate_values) > 1:
-                candidate_text += " [!]]"
+                candidate_text += " [!]"
             cells = [
                 f"<td>{escape_html(package_name)}</td>",
                 f"<td>{escape_html(candidate_text)}</td>",
