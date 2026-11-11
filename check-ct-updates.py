@@ -85,6 +85,7 @@ def run_command(
         command,
         input=input_text,
         text=True,
+        stdin=subprocess.DEVNULL if input_text is None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
