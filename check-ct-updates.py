@@ -615,8 +615,8 @@ def build_global_report(containers: list[dict[str, Any]], generated_at: str) -> 
         rows = []
         for package_name in sorted(package_records):
             package_record = package_records[package_name]
-            candidate_values = sorted(package_record["candidates"])
-            candidate_text = ", ".join(str(candidate_values))
+            candidate_values = str(sorted(package_record["candidates"]))
+            candidate_text = ", ".join(candidate_values)
             if len(candidate_values) > 1:
                 candidate_text += " [!]]"
             cells = [
