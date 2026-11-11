@@ -120,7 +120,10 @@ ANSI_ESCAPE_PATTERN = re.compile(
 
 def strip_ansi(value: Any) -> str:
     """Remove ANSI escape sequences (colors, cursor moves, OSC titles)."""
-    return ANSI_ESCAPE_PATTERN.sub("", str(value))
+    cleaned = ANSI_ESCAPE_PATTERN.sub("", str(value))
+    # Also drop emoji variation selectors and zero-width characters left
+    # over from partially stripped colored banners.
+    return re.sub(r"[\ufe00-\ufe0f\u200b-\u200f\u2060]", "", cleaned)
 
 
 def parse_ct_selection(spec: str) -> set[int]:
@@ -593,8 +596,14 @@ def build_global_report(containers: list[dict[str, Any]], generated_at: str) -> 
         package_records = update_groups[group_key]
         group_container_ids = sorted(container_ids_by_group[group_key])
         content += (
-            f"<h3>{escape_html(distribution_name)} "
-            f"{escape_html(distribution_version)} — {escape_html(manager)}</h3>"
+            f"<h3>{escape_html(distribution_name)}"
+            + (
+                f" {escape_html(distribution_version)}"
+                if distribution_version.lower() not in ("unknown", "")
+                and distribution_version not in distribution_name
+                else ""
+            )
+            + f" — {escape_html(manager)}</h3>"
         )
 
         headers = (
