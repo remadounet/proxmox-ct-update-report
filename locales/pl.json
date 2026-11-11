@@ -34,6 +34,8 @@
   "error_notes_limit_exceeded": "Wygenerowane Notatki CT przekraczają limit znaków Proxmox.",
   "error_root_required": "Ten skrypt musi być uruchomiony jako root.",
   "scan_start": "Rozpoczynam sprawdzanie aktualizacji dla {count} kontenerów...",
+  "scan_start_parallel": "Rozpoczynam sprawdzanie aktualizacji dla {count} kontenerów, do {workers} równolegle...",
+  "warning_unknown_containers": "OSTRZEŻENIE: nieznane identyfikatory kontenerów: {ids}",
   "scan_container": "Sprawdzanie CT {container_id}...",
   "scan_error": "CT {container_id}: BŁĄD: {error}",
   "scan_complete": "CT {container_id}: znaleziono {count} aktualizacji.",

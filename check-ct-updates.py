@@ -4,6 +4,8 @@ Check package updates in Proxmox LXC containers and publish HTML reports.
 
 The script uses only Python's standard library and tools already available on
 the Proxmox host and inside the containers. It does not install packages.
+
+Supported package managers: apt (and nala), dnf, apk (Alpine Linux).
 """
 
 from __future__ import annotations
@@ -16,10 +18,11 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 BEGIN_MARKER = "<!-- BEGIN AUTO UPDATE REPORT -->"
@@ -28,6 +31,8 @@ LEGACY_BEGIN_MARKER = "--- BEGIN AUTO UPDATE REPORT ---"
 LEGACY_END_MARKER = "--- END AUTO UPDATE REPORT ---"
 MAX_CT_DESCRIPTION_LENGTH = 8192
 DEFAULT_LANGUAGE = "en"
+AVAILABLE_LANGUAGES = ["en", "fr", "es", "de", "it", "pt", "pl", "ru", "uk"]
+DEFAULT_MAX_PARALLEL = 4
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 LOCALE_DIRECTORY = SCRIPT_DIRECTORY / "locales"
 
@@ -101,6 +106,47 @@ def escape_html(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
+def parse_ct_selection(spec: str) -> set[int]:
+    """Parse a CT selection such as '100,105-110' into a set of IDs."""
+    selected: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+        if range_match:
+            low, high = int(range_match.group(1)), int(range_match.group(2))
+            if low > high:
+                raise ValueError(f"Invalid CT range: {part}")
+            selected.update(range(low, high + 1))
+        elif part.isdigit():
+            selected.add(int(part))
+        else:
+            raise ValueError(f"Invalid CT selector: {part}")
+    return selected
+
+
+def filter_container_ids(
+    container_ids: list[int],
+    only: str | None,
+    exclude: str | None,
+) -> list[int]:
+    """Apply --only and --exclude selections to the container ID list."""
+    selected_ids = set(container_ids)
+    if only:
+        wanted = parse_ct_selection(only)
+        missing = wanted - selected_ids
+        if missing:
+            print(
+                translate("warning_unknown_containers", ids=", ".join(str(i) for i in sorted(missing))),
+                file=sys.stderr,
+            )
+        selected_ids &= wanted
+    if exclude:
+        selected_ids -= parse_ct_selection(exclude)
+    return sorted(selected_ids)
+
+
 def get_container_ids() -> list[int]:
     """Return all container IDs known to pct."""
     result = run_command(["pct", "list"], timeout=30)
@@ -153,6 +199,7 @@ def detect_package_manager(container_id: int, distribution: dict[str, str]) -> s
         ("nala", "command -v nala >/dev/null 2>&1"),
         ("apt", "command -v apt-get >/dev/null 2>&1"),
         ("dnf", "command -v dnf >/dev/null 2>&1"),
+        ("apk", "command -v apk >/dev/null 2>&1"),
     ]
     for manager, check_command in checks:
         result = run_container_command(container_id, check_command, timeout=20)
@@ -166,6 +213,8 @@ def detect_package_manager(container_id: int, distribution: dict[str, str]) -> s
         return "apt"
     if distribution_id in {"fedora", "rhel", "centos", "rocky", "almalinux"}:
         return "dnf"
+    if distribution_id in {"alpine"}:
+        return "apk"
     return "unknown"
 
 
@@ -182,16 +231,17 @@ def parse_apt_updates(output: str) -> list[dict[str, str]]:
     return packages
 
 
-def get_apt_updates(container_id: int) -> list[dict[str, str]]:
+def get_apt_updates(container_id: int, skip_refresh: bool = False) -> list[dict[str, str]]:
     """Refresh APT metadata and retrieve available package updates."""
-    nala_check = run_container_command(container_id, "command -v nala >/dev/null 2>&1", timeout=20)
-    if nala_check.returncode == 0:
-        refresh = run_container_command(container_id, "nala update", timeout=900)
-    else:
-        refresh = run_container_command(container_id, "apt-get update -qq", timeout=900)
+    if not skip_refresh:
+        nala_check = run_container_command(container_id, "command -v nala >/dev/null 2>&1", timeout=20)
+        if nala_check.returncode == 0:
+            refresh = run_container_command(container_id, "nala update", timeout=900)
+        else:
+            refresh = run_container_command(container_id, "apt-get update -qq", timeout=900)
 
-    if refresh.returncode != 0:
-        raise RuntimeError(refresh.stderr.strip() or translate("error_package_refresh"))
+        if refresh.returncode != 0:
+            raise RuntimeError(refresh.stderr.strip() or translate("error_package_refresh"))
 
     result = run_container_command(container_id, "apt list --upgradable 2>/dev/null", timeout=180)
     if result.returncode != 0:
@@ -230,11 +280,12 @@ def parse_dnf_query_output(output: str) -> list[dict[str, str]]:
     return list(unique.values())
 
 
-def get_dnf_updates(container_id: int) -> list[dict[str, str]]:
+def get_dnf_updates(container_id: int, skip_refresh: bool = False) -> list[dict[str, str]]:
     """Refresh DNF metadata and retrieve package upgrades."""
-    refresh = run_container_command(container_id, "dnf -q makecache --refresh", timeout=900)
-    if refresh.returncode != 0:
-        raise RuntimeError(refresh.stderr.strip() or translate("error_package_refresh"))
+    if not skip_refresh:
+        refresh = run_container_command(container_id, "dnf -q makecache --refresh", timeout=900)
+        if refresh.returncode != 0:
+            raise RuntimeError(refresh.stderr.strip() or translate("error_package_refresh"))
 
     query = r"""dnf -q repoquery --upgrades --queryformat '%{name}.%{arch}|%{evr}\n'"""
     result = run_container_command(container_id, query, timeout=600)
@@ -253,6 +304,66 @@ def get_dnf_updates(container_id: int) -> list[dict[str, str]]:
     return packages
 
 
+APK_PACKAGE_PATTERN = re.compile(r"^(.+?)-([0-9][^-]*(?:-r[0-9]+)?)$")
+APK_UPGRADABLE_FROM_PATTERN = re.compile(r"\[upgradable from:\s*([^\]]+)\]")
+
+
+def split_apk_name_version(token: str) -> tuple[str, str] | None:
+    """Split an apk token such as 'openssl-3.3.1-r0' into (name, version)."""
+    match = APK_PACKAGE_PATTERN.match(token.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def parse_apk_updates(output: str) -> list[dict[str, str]]:
+    """Parse 'apk list --upgradable' output.
+
+    Typical line:
+      openssl-3.3.1-r0 x86_64 {main} [upgradable from: openssl-3.3.0-r0]
+    """
+    packages: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("WARNING") or line.startswith("OK:"):
+            continue
+        fields = line.split()
+        if not fields:
+            continue
+        split = split_apk_name_version(fields[0])
+        if not split:
+            continue
+        package_name, candidate = split
+
+        installed = ""
+        from_match = APK_UPGRADABLE_FROM_PATTERN.search(line)
+        if from_match:
+            installed_split = split_apk_name_version(from_match.group(1).split()[-1])
+            if installed_split and installed_split[0] == package_name:
+                installed = installed_split[1]
+
+        key = (package_name, candidate)
+        if key not in seen:
+            seen.add(key)
+            packages.append({"package": package_name, "candidate": candidate, "installed": installed})
+    return packages
+
+
+def get_apk_updates(container_id: int, skip_refresh: bool = False) -> list[dict[str, str]]:
+    """Refresh APK metadata and retrieve package upgrades."""
+    if not skip_refresh:
+        refresh = run_container_command(container_id, "apk update", timeout=300)
+        if refresh.returncode != 0:
+            raise RuntimeError(refresh.stderr.strip() or translate("error_package_refresh"))
+
+    result = run_container_command(container_id, "apk list --upgradable 2>/dev/null", timeout=180)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or translate("error_update_list"))
+    return parse_apk_updates(result.stdout)
+
+
 def get_installed_versions(
     container_id: int,
     manager: str,
@@ -262,33 +373,51 @@ def get_installed_versions(
     if not package_names:
         return {}
 
+    quoted_names = " ".join(shlex.quote(name) for name in package_names)
+
     if manager == "apt":
-        quoted_names = " ".join(shlex.quote(name) for name in package_names)
         command = (
             f"dpkg-query -W -f='${{Package}}|${{Version}}\\n' {quoted_names} "
             "2>/dev/null || true"
         )
     elif manager == "dnf":
-        quoted_names = " ".join(shlex.quote(name) for name in package_names)
         command = (
             "for package in " + quoted_names + "; do "
             "version=$(rpm -q --qf '%{EVR}' \"$package\" 2>/dev/null || true); "
             "if [ -n \"$version\" ]; then printf '%s|%s\\n' \"$package\" \"$version\"; fi; "
             "done"
         )
+    elif manager == "apk":
+        # One pass over the installed list, then match locally: apk has no
+        # efficient batch query for arbitrary package lists.
+        command = "apk list -I 2>/dev/null || true"
     else:
         return {}
 
     result = run_container_command(container_id, command, timeout=180)
+    wanted = set(package_names)
     installed: dict[str, str] = {}
+
+    if manager == "apk":
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            split = split_apk_name_version(fields[0])
+            if split and split[0] in wanted:
+                installed[split[0]] = split[1]
+        return installed
+
     for line in result.stdout.splitlines():
         if "|" in line:
             package_name, version = line.split("|", 1)
-            installed[package_name.strip()] = version.strip()
+            package_name = package_name.strip()
+            if package_name in wanted:
+                installed[package_name] = version.strip()
     return installed
 
 
-def collect_container_updates(container_id: int) -> dict[str, Any]:
+def collect_container_updates(container_id: int, skip_refresh: bool = False) -> dict[str, Any]:
     """Collect update information for one running container."""
     container_status = get_container_status(container_id)
     record: dict[str, Any] = {
@@ -310,9 +439,11 @@ def collect_container_updates(container_id: int) -> dict[str, Any]:
         record["manager"] = manager
 
         if manager == "apt":
-            updates = get_apt_updates(container_id)
+            updates = get_apt_updates(container_id, skip_refresh)
         elif manager == "dnf":
-            updates = get_dnf_updates(container_id)
+            updates = get_dnf_updates(container_id, skip_refresh)
+        elif manager == "apk":
+            updates = get_apk_updates(container_id, skip_refresh)
         else:
             raise RuntimeError(translate("error_unsupported_manager"))
 
@@ -323,7 +454,9 @@ def collect_container_updates(container_id: int) -> dict[str, Any]:
         )
 
         for update in updates:
-            update["installed"] = installed_versions.get(update["package"], "")
+            update.setdefault("installed", "")
+            if not update["installed"]:
+                update["installed"] = installed_versions.get(update["package"], "")
             update["container_id"] = container_id
 
         record["updates"] = updates
@@ -572,10 +705,7 @@ def get_proxmox_description(config_path: str) -> str:
 
 
 def set_proxmox_description(config_path: str, description: str) -> None:
-    """Write a Proxmox description field using a temporary JSON file."""
-    # Passing HTML directly as a command-line argument is safe with subprocess
-    # but may exceed OS argument limits; stdin is not supported by pvesh here.
-    # Use a temporary file only for our own staging, then pass the value directly.
+    """Write a Proxmox description field using pvesh."""
     result = run_command(
         ["pvesh", "set", config_path, "--description", description],
         timeout=60,
@@ -623,9 +753,9 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lang",
-        choices=["en", "fr", "es", "de", "it", "pt", "pl"],
+        choices=AVAILABLE_LANGUAGES,
         default=DEFAULT_LANGUAGE,
-        help="Report language (default: en).",
+        help=f"Report language (default: {DEFAULT_LANGUAGE}).",
     )
     parser.add_argument(
         "--ct-notes",
@@ -642,6 +772,28 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Collect and print reports without changing Proxmox Notes.",
     )
+    parser.add_argument(
+        "--only",
+        metavar="IDS",
+        help="Scan only these containers, e.g. '100,105-110'.",
+    )
+    parser.add_argument(
+        "--exclude",
+        metavar="IDS",
+        help="Skip these containers, e.g. '101,200-210'.",
+    )
+    parser.add_argument(
+        "--skip-refresh",
+        action="store_true",
+        help="Do not refresh package metadata (faster, but lists may be stale).",
+    )
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=DEFAULT_MAX_PARALLEL,
+        metavar="N",
+        help=f"Number of containers scanned concurrently (default: {DEFAULT_MAX_PARALLEL}).",
+    )
     return parser.parse_args()
 
 
@@ -656,43 +808,79 @@ def main() -> int:
         print(translate("error_root_required"), file=sys.stderr)
         return 1
 
+    if arguments.max_parallel < 1:
+        print("ERROR: --max-parallel must be at least 1.", file=sys.stderr)
+        return 1
+
     try:
         node_name = get_proxmox_node_name()
-        container_ids = get_container_ids()
+        container_ids_all = get_container_ids()
+        container_ids = filter_container_ids(container_ids_all, arguments.only, arguments.exclude)
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
     generated_at = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    print(translate("scan_start", count=len(container_ids)))
+    print(
+        translate(
+            "scan_start_parallel",
+            count=len(container_ids),
+            workers=min(arguments.max_parallel, max(len(container_ids), 1)),
+        )
+    )
 
-    container_results: list[dict[str, Any]] = []
-    for container_id in container_ids:
-        print(translate("scan_container", container_id=container_id))
-        result = collect_container_updates(container_id)
-        container_results.append(result)
+    container_results: dict[int, dict[str, Any]] = {}
+    print_lock = Lock()
 
-        update_count = len(result.get("updates", []))
-        if result.get("error"):
-            print(translate("scan_error", container_id=container_id, error=result["error"]))
-        else:
-            print(translate("scan_complete", container_id=container_id, count=update_count))
-
-        if arguments.ct_notes and result["status"] == "running":
-            try:
-                container_report = build_container_report(result, generated_at)
-                if arguments.dry_run:
-                    print(f"\n--- CT {container_id} REPORT ---\n{container_report}\n")
-                else:
-                    update_container_description(container_id, container_report, node_name)
-                    print(translate("ct_notes_updated", container_id=container_id))
-            except Exception as error:
+    def scan_worker(container_id: int) -> dict[str, Any]:
+        result = collect_container_updates(container_id, arguments.skip_refresh)
+        with print_lock:
+            if result.get("error"):
+                print(translate("scan_error", container_id=container_id, error=result["error"]))
+            else:
                 print(
-                    translate("ct_notes_error", container_id=container_id, error=error),
-                    file=sys.stderr,
+                    translate(
+                        "scan_complete",
+                        container_id=container_id,
+                        count=len(result.get("updates", [])),
+                    )
                 )
+        return result
 
-    global_report = build_global_report(container_results, generated_at)
+    with ThreadPoolExecutor(max_workers=arguments.max_parallel) as executor:
+        futures = {executor.submit(scan_worker, cid): cid for cid in container_ids}
+        for future in as_completed(futures):
+            container_id = futures[future]
+            try:
+                container_results[container_id] = future.result()
+            except Exception as error:
+                container_results[container_id] = {
+                    "id": container_id,
+                    "status": "error",
+                    "distribution": {},
+                    "manager": "unknown",
+                    "updates": [],
+                    "error": str(error),
+                }
+            result = container_results[container_id]
+
+            if arguments.ct_notes and result["status"] == "running":
+                try:
+                    container_report = build_container_report(result, generated_at)
+                    if arguments.dry_run:
+                        with print_lock:
+                            print(f"\n--- CT {container_id} REPORT ---\n{container_report}\n")
+                    else:
+                        update_container_description(container_id, container_report, node_name)
+                        print(translate("ct_notes_updated", container_id=container_id))
+                except Exception as error:
+                    print(
+                        translate("ct_notes_error", container_id=container_id, error=error),
+                        file=sys.stderr,
+                    )
+
+    ordered_results = [container_results[cid] for cid in container_ids if cid in container_results]
+    global_report = build_global_report(ordered_results, generated_at)
 
     if arguments.dry_run:
         print("\n--- GLOBAL REPORT ---")
@@ -705,8 +893,8 @@ def main() -> int:
             print(translate("node_notes_error", error=error), file=sys.stderr)
             return 1
 
-    total_updates = sum(len(item.get("updates", [])) for item in container_results)
-    print(translate("scan_finished", count=len(container_results), updates=total_updates))
+    total_updates = sum(len(item.get("updates", [])) for item in ordered_results)
+    print(translate("scan_finished", count=len(ordered_results), updates=total_updates))
     return 0
 
 

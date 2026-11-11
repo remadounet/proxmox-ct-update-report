@@ -34,6 +34,8 @@
   "error_notes_limit_exceeded": "Las notas generadas del CT superan el límite de caracteres de Proxmox.",
   "error_root_required": "Este script debe ejecutarse como root.",
   "scan_start": "Iniciando el análisis de actualizaciones para {count} contenedor(es)...",
+  "scan_start_parallel": "Iniciando el análisis de actualizaciones para {count} contenedor(es), hasta {workers} análisis en paralelo...",
+  "warning_unknown_containers": "ADVERTENCIA: ID de contenedor desconocido(s): {ids}",
   "scan_container": "Comprobando CT {container_id}...",
   "scan_error": "CT {container_id}: ERROR: {error}",
   "scan_complete": "CT {container_id}: {count} actualización(es) encontrada(s).",
