@@ -95,9 +95,14 @@ def run_command(
 
 
 def run_container_command(container_id: int, command: str, timeout: int = 600) -> subprocess.CompletedProcess[str]:
-    """Run a shell command inside an LXC container."""
+    """Run a shell command inside an LXC container.
+
+    A non-login shell is used on purpose: community-scripts and similar
+    templates print a colored banner from /etc/profile.d on login shells,
+    which would pollute the command's stdout.
+    """
     return run_command(
-        ["pct", "exec", str(container_id), "--", "bash", "-lc", command],
+        ["pct", "exec", str(container_id), "--", "bash", "-c", command],
         timeout=timeout,
     )
 
@@ -105,6 +110,17 @@ def run_container_command(container_id: int, command: str, timeout: int = 600) -
 def escape_html(value: Any) -> str:
     """Escape text for safe HTML output."""
     return html.escape(str(value), quote=True)
+
+
+ANSI_ESCAPE_PATTERN = re.compile(
+    r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[P^_].*?\x1b\\",
+    re.DOTALL,
+)
+
+
+def strip_ansi(value: Any) -> str:
+    """Remove ANSI escape sequences (colors, cursor moves, OSC titles)."""
+    return ANSI_ESCAPE_PATTERN.sub("", str(value))
 
 
 def parse_ct_selection(spec: str) -> set[int]:
@@ -184,7 +200,10 @@ def get_distribution(container_id: int) -> dict[str, str]:
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or translate("error_os_release"))
 
-    values = result.stdout.strip().splitlines()
+    values = [strip_ansi(line) for line in result.stdout.strip().splitlines() if line.strip()]
+    # Defensive: if a login banner still leaks into stdout, our three
+    # values are the last lines printed by the command.
+    values = values[-3:]
     while len(values) < 3:
         values.append("unknown")
     return {
@@ -702,7 +721,9 @@ def get_proxmox_description(config_path: str) -> str:
         config = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise RuntimeError(translate("error_parse_description")) from error
-    return str(config.get("description") or "")
+    # Community-scripts and similar tools store ANSI-colored banners in the
+    # Notes; strip them so Proxmox renders clean text.
+    return strip_ansi(config.get("description") or "")
 
 
 def set_proxmox_description(config_path: str, description: str) -> None:
