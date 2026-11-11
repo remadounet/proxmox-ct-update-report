@@ -113,7 +113,7 @@ def escape_html(value: Any) -> str:
 
 
 ANSI_ESCAPE_PATTERN = re.compile(
-    r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[P^_].*?\x1b\\",
+    r"\x1b\[[0-9;]*[A-Za-z]|\x1b][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[P^_].*?\x1b\\",
     re.DOTALL,
 )
 
@@ -328,7 +328,7 @@ def get_dnf_updates(container_id: int, skip_refresh: bool = False) -> list[dict[
 
 
 APK_PACKAGE_PATTERN = re.compile(r"^(.+?)-([0-9][^-]*(?:-r[0-9]+)?)$")
-APK_UPGRADABLE_FROM_PATTERN = re.compile(r"\[upgradable from:\s*([^\]]+)\]")
+APK_UPGRADABLE_FROM_PATTERN = re.compile(r"\[upgradable from:\s*([^]]+)]")
 
 
 def split_apk_name_version(token: str) -> tuple[str, str] | None:
@@ -480,7 +480,7 @@ def collect_container_updates(container_id: int, skip_refresh: bool = False) -> 
             update.setdefault("installed", "")
             if not update["installed"]:
                 update["installed"] = installed_versions.get(update["package"], "")
-            update["container_id"] = container_id
+            update["container_id"] = str(container_id)
 
         record["updates"] = updates
     except Exception as error:
@@ -565,9 +565,9 @@ def build_global_report(containers: list[dict[str, Any]], generated_at: str) -> 
             continue
         distribution = container.get("distribution") or {}
         group_key = (
-            distribution.get("name", translate("unknown")),
-            distribution.get("version", "unknown"),
-            container.get("manager", "unknown"),
+            str(distribution.get("name", translate("unknown"))),
+            str(distribution.get("version", "unknown")),
+            str(container.get("manager", "unknown")),
         )
         container_ids_by_group[group_key].add(container["id"])
 
@@ -616,7 +616,7 @@ def build_global_report(containers: list[dict[str, Any]], generated_at: str) -> 
         for package_name in sorted(package_records):
             package_record = package_records[package_name]
             candidate_values = sorted(package_record["candidates"])
-            candidate_text = ", ".join(candidate_values)
+            candidate_text = ", ".join(str(candidate_values))
             if len(candidate_values) > 1:
                 candidate_text += " ⚠"
             cells = [
@@ -863,20 +863,20 @@ def main() -> int:
     container_results: dict[int, dict[str, Any]] = {}
     print_lock = Lock()
 
-    def scan_worker(container_id: int) -> dict[str, Any]:
-        result = collect_container_updates(container_id, arguments.skip_refresh)
+    def scan_worker(scan_container_id: int) -> dict[str, Any]:
+        scan_result = collect_container_updates(scan_container_id, arguments.skip_refresh)
         with print_lock:
-            if result.get("error"):
-                print(translate("scan_error", container_id=container_id, error=result["error"]))
+            if scan_result.get("error"):
+                print(translate("scan_error", container_id=scan_container_id, error=scan_result["error"]))
             else:
                 print(
                     translate(
                         "scan_complete",
-                        container_id=container_id,
-                        count=len(result.get("updates", [])),
+                        container_id=scan_container_id,
+                        count=len(scan_result.get("updates", [])),
                     )
                 )
-        return result
+        return scan_result
 
     with ThreadPoolExecutor(max_workers=arguments.max_parallel) as executor:
         futures = {executor.submit(scan_worker, cid): cid for cid in container_ids}
