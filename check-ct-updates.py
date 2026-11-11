@@ -510,7 +510,7 @@ def build_container_report(container: dict[str, Any], generated_at: str) -> str:
         rows.append(
             "<tr>"
             f"<td>{escape_html(update['package'])}</td>"
-            f"<td>{escape_html(update.get('installed') or '—')}</td>"
+            f"<td>{escape_html(update.get('installed') or '-')}</td>"
             f"<td>{escape_html(update['candidate'])}</td>"
             "</tr>"
         )
@@ -603,7 +603,7 @@ def build_global_report(containers: list[dict[str, Any]], generated_at: str) -> 
                 and distribution_version not in distribution_name
                 else ""
             )
-            + f" — {escape_html(manager)}</h3>"
+            + f" - {escape_html(manager)}</h3>"
         )
 
         headers = (
@@ -618,14 +618,14 @@ def build_global_report(containers: list[dict[str, Any]], generated_at: str) -> 
             candidate_values = sorted(package_record["candidates"])
             candidate_text = ", ".join(str(candidate_values))
             if len(candidate_values) > 1:
-                candidate_text += " ⚠"
+                candidate_text += " [!]]"
             cells = [
                 f"<td>{escape_html(package_name)}</td>",
                 f"<td>{escape_html(candidate_text)}</td>",
             ]
             for container_id in group_container_ids:
                 installed = package_record["installed"].get(container_id, "")
-                cells.append(f"<td>{escape_html(installed or '—')}</td>")
+                cells.append(f"<td>{escape_html(installed or '-')}</td>")
             rows.append("<tr>" + "".join(cells) + "</tr>")
 
         content += (
